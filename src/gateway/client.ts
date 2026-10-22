@@ -217,24 +217,31 @@ export class GatewayClient extends EventEmitter {
     send(op: number, d: any): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-        const now = Date.now();
-        if (now > this.commandResetAt) {
-            this.commandsSent   = 0;
-            this.commandResetAt = now + GATEWAY_RATE_PERIOD;
+        // Heartbeats must NEVER be queued behind the op budget: a heartbeat
+        // delayed past the interval trips our own zombie-detection close and
+        // kills a healthy connection. Discord always admits op-1, so exempt it
+        // from the soft cap below.
+        if (op !== GatewayOpcodes.HEARTBEAT) {
+            const now = Date.now();
+            if (now > this.commandResetAt) {
+                this.commandsSent   = 0;
+                this.commandResetAt = now + GATEWAY_RATE_PERIOD;
+            }
+
+            if (this.commandsSent >= GATEWAY_RATE_LIMIT) {
+                log.warn("Gateway rate limit reached, queuing…");
+                const delay = this.commandResetAt - now + 100;
+                const t = setTimeout(() => {
+                    this.pendingRateLimitTimers.delete(t);
+                    this.send(op, d);
+                }, delay);
+                this.pendingRateLimitTimers.add(t);
+                return;
+            }
+
+            this.commandsSent++;
         }
 
-        if (this.commandsSent >= GATEWAY_RATE_LIMIT) {
-            log.warn("Gateway rate limit reached, queuing…");
-            const delay = this.commandResetAt - now + 100;
-            const t = setTimeout(() => {
-                this.pendingRateLimitTimers.delete(t);
-                this.send(op, d);
-            }, delay);
-            this.pendingRateLimitTimers.add(t);
-            return;
-        }
-
-        this.commandsSent++;
         this.ws.send(JSON.stringify({ op, d }));
     }
 

@@ -28,6 +28,29 @@ export const config = {
     statusPollIntervalMs:   parseInt(process.env.STATUS_POLL_INTERVAL_MS   || "120000",  10),
     dailySummaryIntervalMs: parseInt(process.env.DAILY_SUMMARY_INTERVAL_MS || "3600000", 10),
 
+    // ── Presence tracking (op 14) ─────────────────────────────────────────────
+    //
+    // Discord silently expires GUILD_SUBSCRIBE presence subscriptions — a
+    // member who is offline stops streaming PRESENCE_UPDATE within ~60 s of
+    // subscribing, and re-subscribing produces NO event for offline members.
+    // The renewal cadence must therefore sit comfortably below that expiry
+    // window (the old 4-minute interval left ~3 unsubscribed minutes per cycle,
+    // which is how a target's status could get "locked" until restart).
+    //
+    //   presenceRenewIntervalMs — op 14 re-subscription cadence (default 30 s).
+    //                             With 1-2 targets this is negligible traffic:
+    //                             one op-14 per mutual guild per cycle.
+    //
+    //   presenceStaleOfflineMs  — offline-reconciliation watchdog threshold.
+    //                             When a target cached as active (online/idle/
+    //                             dnd) produces no presence evidence for this
+    //                             long, sweepStalePresence forces it offline
+    //                             through the normal PRESENCE_UPDATE path.
+    //                             0 = auto-derive: 2 × statusPollIntervalMs +
+    //                             60 s buffer (5 min at defaults).
+    presenceRenewIntervalMs: parseInt(process.env.PRESENCE_RENEW_INTERVAL_MS || "30000", 10),
+    presenceStaleOfflineMs:  parseInt(process.env.PRESENCE_STALE_OFFLINE_MS  || "0",     10),
+
     // When true: adds ±20% random jitter to all polling intervals and
     // randomises the browser/OS strings in the Discord gateway IDENTIFY.
     randomJitter: process.env.RANDOM_JITTER === "true",

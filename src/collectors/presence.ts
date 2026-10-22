@@ -1,4 +1,5 @@
 import { createLogger } from "../utils/logger";
+import { config } from "../utils/config";
 import { getStmts } from "../database/queries";
 import { evaluateEvent } from "../alerts/engine";
 import { pushSSEEvent } from "../api/routes/events";
@@ -13,6 +14,45 @@ interface PresenceState {
 }
 
 const currentPresence: Map<string, PresenceState> = new Map();
+
+// ── Presence evidence tracking (offline-reconciliation watchdog) ─────────────
+//
+// Discord expires op-14 presence subscriptions for offline members within
+// ~60 s, and re-subscribing produces NO event for offline members. A missed
+// offline transition therefore can never self-heal from gateway events alone —
+// the cached status would stay "locked" (e.g. online) until process restart.
+//
+// To break that lock we record the last time each target produced POSITIVE
+// presence evidence:
+//   - any PRESENCE_UPDATE (status OR activity change), or
+//   - appearing in a GUILD_MEMBERS_CHUNK presences list (op-8 poll),
+// and sweepStalePresence() force-offlines targets cached as active whose
+// evidence is older than the threshold. Online targets always appear in chunk
+// presences (op-8 requests them explicitly with presences: true), so
+// "no evidence across two full poll rounds" is strong offline evidence —
+// while a user who is genuinely online produces evidence every few seconds.
+const lastPresenceEvidenceAt = new Map<string, number>();
+
+/** Record positive presence evidence for a target. Cheap: one Map.set. */
+export function markPresenceEvidence(targetId: string): void {
+    lastPresenceEvidenceAt.set(targetId, Date.now());
+}
+
+/** Re-baseline every cached target's evidence clock (call on RESUMED —
+ *  chunks re-arrive within seconds of a resume, and the sweep must not fire
+ *  inside the reconnect gap where no evidence can arrive). */
+export function touchAllPresenceEvidence(): void {
+    const now = Date.now();
+    for (const id of currentPresence.keys()) lastPresenceEvidenceAt.set(id, now);
+}
+
+/** Effective stale-offline threshold. 0 in config = derive from the status
+ *  poll interval (2 full poll rounds + 60 s of stagger/reconnect slack).
+ *  Read at sweep time so runtime config changes apply immediately. */
+export function getStalePresenceThresholdMs(): number {
+    if (config.presenceStaleOfflineMs > 0) return config.presenceStaleOfflineMs;
+    return 2 * config.statusPollIntervalMs + 60_000;
+}
 
 export function getPlatform(clientStatus: any): string | null {
     if (!clientStatus) return null;
@@ -31,6 +71,11 @@ export function isActiveStatus(status: string): boolean {
 }
 
 export function handlePresenceUpdate(targetId: string, data: any): void {
+    // Any PRESENCE_UPDATE is positive evidence the gateway path for this
+    // target is alive — stamp BEFORE the no-change early-return below so
+    // activity-only / duplicate updates still count as evidence.
+    markPresenceEvidence(targetId);
+
     const stmts     = getStmts();
     const newStatus = data.status || "offline";
     const clientStatus = data.client_status || null;
@@ -110,6 +155,44 @@ export function handlePresenceUpdate(targetId: string, data: any): void {
 /** Drop the in-memory presence state for a target. Called when a target is deleted. */
 export function removeTargetState(targetId: string): void {
     currentPresence.delete(targetId);
+    lastPresenceEvidenceAt.delete(targetId);
+}
+
+/**
+ * Offline-reconciliation sweep. Force-offlines every target whose cached
+ * status is active (online/idle/dnd) but which has produced no presence
+ * evidence for longer than getStalePresenceThresholdMs().
+ *
+ * Goes through handlePresenceUpdate so the correction is indistinguishable
+ * from a real transition: open presence sessions close, a PRESENCE_UPDATE
+ * event persists, alerts evaluate, and the dashboard/SSE receives the exact
+ * same event shape it always has. Returns the number of targets corrected.
+ *
+ * Callers should skip the sweep while the gateway is disconnected (no
+ * evidence can arrive during an outage; forcing offline then would be a
+ * guess, and chunk evidence after reconnect corrects state anyway).
+ */
+export function sweepStalePresence(): number {
+    const threshold = getStalePresenceThresholdMs();
+    const now       = Date.now();
+    let corrected   = 0;
+
+    for (const [targetId, state] of currentPresence) {
+        if (!isActiveStatus(state.status)) continue;
+
+        const lastSeen = lastPresenceEvidenceAt.get(targetId) ?? 0;
+        if (now - lastSeen < threshold) continue;
+
+        log.info(
+            `No presence evidence for ${targetId} in ${Math.round((now - lastSeen) / 1000)} s ` +
+            `while cached as "${state.status}" — forcing offline ` +
+            `(op-14 subscription expiry recovery)`
+        );
+        handlePresenceUpdate(targetId, { status: "offline", client_status: null });
+        corrected++;
+    }
+
+    return corrected;
 }
 
 export function initPresence(targetId: string, data: any): void {
@@ -119,6 +202,7 @@ export function initPresence(targetId: string, data: any): void {
     const now          = Date.now();
 
     currentPresence.set(targetId, { status, platform, clientStatus });
+    markPresenceEvidence(targetId);
 
     // Only open a session for non-offline states
     if (status !== "offline") {
