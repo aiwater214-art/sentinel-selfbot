@@ -39,6 +39,8 @@ export const RUNTIME_KEYS = [
     "PROFILE_POLL_INTERVAL_MS",
     "STATUS_POLL_INTERVAL_MS",
     "DAILY_SUMMARY_INTERVAL_MS",
+    "PRESENCE_RENEW_INTERVAL_MS",
+    "PRESENCE_STALE_OFFLINE_MS",
 ] as const;
 
 export type RuntimeKey = typeof RUNTIME_KEYS[number];
@@ -65,6 +67,8 @@ const NUMERIC_MIN: Partial<Record<RuntimeKey, number>> = {
     PROFILE_POLL_INTERVAL_MS:         60_000,    // 1 min
     STATUS_POLL_INTERVAL_MS:          30_000,    // 30 s
     DAILY_SUMMARY_INTERVAL_MS:        300_000,   // 5 min
+    PRESENCE_RENEW_INTERVAL_MS:       10_000,    // 10 s — floor to stay under the gateway op budget
+    PRESENCE_STALE_OFFLINE_MS:        0,         // 0 = auto-derive from STATUS_POLL_INTERVAL_MS
 };
 
 // Maps env key names → config object props + type parsers.
@@ -94,6 +98,8 @@ const KEY_MAP: Record<RuntimeKey, { prop: keyof typeof config; parse: (v: string
     PROFILE_POLL_INTERVAL_MS:         { prop: "profilePollIntervalMs",     parse: v => parseInt(v, 10) },
     STATUS_POLL_INTERVAL_MS:          { prop: "statusPollIntervalMs",      parse: v => parseInt(v, 10) },
     DAILY_SUMMARY_INTERVAL_MS:        { prop: "dailySummaryIntervalMs",    parse: v => parseInt(v, 10) },
+    PRESENCE_RENEW_INTERVAL_MS:       { prop: "presenceRenewIntervalMs",   parse: v => parseInt(v, 10) },
+    PRESENCE_STALE_OFFLINE_MS:        { prop: "presenceStaleOfflineMs",    parse: v => parseInt(v, 10) },
 };
 
 /**

@@ -8,6 +8,7 @@ import { hydrateFromSupabase } from "./database/hydrator";
 import { GatewayClient } from "./gateway/client";
 import {
     handlePresenceUpdate, initPresence, getCurrentPresence,
+    sweepStalePresence, touchAllPresenceEvidence,
 } from "./collectors/presence";
 import {
     handleActivityUpdate, initActivities, getCurrentActivities,
@@ -232,9 +233,26 @@ function requestInitialPresences(client: GatewayClient): void {
 // to periodic REQUEST_GUILD_MEMBERS polling.
 //
 // Must be called after READY and after RESUMED (subscriptions are dropped on
-// session interruption). Re-called periodically so they don't silently expire.
+// session interruption), and re-called on a fast cadence (~30 s): Discord
+// silently expires op-14 subscriptions for offline members within ~60 s of
+// subscribing, so the old 4-minute renewal left multi-minute unsubscribe
+// windows that could lock a target on a stale status.
 
 let presenceSubscriptionInterval: NodeJS.Timeout | null = null;
+
+// Op-14 sends per renewal cycle. The gateway soft cap is 40 ops / 60 s and
+// heartbeats + op-8 polls + bootstrap traffic share it; capping each cycle at
+// 16 keeps a 30 s cadence (~32 ops / 60 s) well inside the budget. With the
+// typical 1-2 targets this cap never binds — it only engages for accounts in
+// many guilds, where the round-robin cursor guarantees every guild is renewed
+// within ceil(n/16) cycles (≤ 60 s at n ≤ 32, still inside the expiry window).
+const MAX_OP14_PER_CYCLE = 16;
+let op14Cursor = 0;
+
+// Fingerprint of the last renewal's subscription set — lets the 30 s cadence
+// log at debug level when nothing changed, and at info level only when the
+// target/guild composition actually changes.
+let lastSubFingerprint = "";
 
 function subscribeGuildPresences(client: GatewayClient): void {
     const stmts = getStmts();
@@ -247,44 +265,97 @@ function subscribeGuildPresences(client: GatewayClient): void {
     const guildMembers = new Map<string, Set<string>>();
 
     for (const row of rows) {
-        if (!row.mutual_guilds) continue;
-        try {
-            const guilds = JSON.parse(row.mutual_guilds) as any[];
-            for (const g of guilds) {
-                const id: string | undefined = typeof g === "string" ? g : g.id;
-                if (!id) continue;
-                const set = guildMembers.get(id) ?? new Set<string>();
-                set.add(row.user_id);
-                guildMembers.set(id, set);
-            }
-        } catch { /* malformed JSON — skip */ }
-    }
+        let guilds: any[] | null = null;
+        if (row.mutual_guilds) {
+            try { guilds = JSON.parse(row.mutual_guilds) as any[]; } catch { /* malformed — fall through */ }
+        }
 
-    // Also subscribe to every selfbot guild so new targets (before their first
-    // profile poll) still get real-time presence via the guild-level stream.
-    for (const guild of client.getGuilds()) {
-        const id: string | undefined = typeof guild === "string" ? guild : guild.id;
-        if (!id) continue;
-        if (!guildMembers.has(id)) guildMembers.set(id, new Set<string>());
+        // Primary: per-target mutual guild list, if we have it.
+        // Fallback: name the target in EVERY selfbot guild. The previous
+        // fallback sent op 14 with NO members (guild-level sidebar stream),
+        // which excludes users outside the visible member list — a target with
+        // a stale/missing snapshot silently lost its presence stream. Naming
+        // the member explicitly keeps their stream alive until the next
+        // profile poll corrects mutual_guilds.
+        const source: any[] = (guilds && guilds.length > 0) ? guilds : client.getGuilds();
+
+        for (const g of source) {
+            const id: string | undefined = typeof g === "string" ? g : g?.id;
+            if (!id) continue;
+            const set = guildMembers.get(id) ?? new Set<string>();
+            set.add(row.user_id);
+            guildMembers.set(id, set);
+        }
     }
 
     if (!guildMembers.size) return;
 
-    // Stagger sends to stay within the 120 ops/60 s gateway rate limit.
-    const STAGGER_MS = 300;
-    let i = 0;
-    for (const [guildId, memberSet] of guildMembers) {
-        const memberIds = Array.from(memberSet);
-        const delay = i++ * STAGGER_MS;
-        setTimeout(() => {
-            if (client.isConnected()) client.subscribeGuildPresence(guildId, memberIds);
-        }, delay);
+    const all = [...guildMembers.entries()];
+
+    // Round-robin when the guild count exceeds the per-cycle op budget so every
+    // guild still renews within ceil(n / MAX_OP14_PER_CYCLE) cycles. With 1-2
+    // targets the whole map always fits in a single cycle.
+    let batch = all;
+    if (all.length > MAX_OP14_PER_CYCLE) {
+        const start = op14Cursor % all.length;
+        batch = [];
+        for (let k = 0; k < MAX_OP14_PER_CYCLE; k++) {
+            batch.push(all[(start + k) % all.length]);
+        }
+        op14Cursor = (start + MAX_OP14_PER_CYCLE) % all.length;
     }
 
-    log.info(
-        `Subscribed to presence stream for ${guildMembers.size} guild(s), ` +
-        `tracking ${rows.length} target(s) via op 14 member push`
-    );
+    const fingerprint = all
+        .map(([guildId, set]) => `${guildId}=${[...set].sort().join(",")}`)
+        .sort()
+        .join("|");
+
+    // Stagger sends to stay within the gateway rate limit.
+    const STAGGER_MS = 300;
+    batch.forEach(([guildId, memberSet], i) => {
+        const memberIds = Array.from(memberSet);
+        setTimeout(() => {
+            if (client.isConnected()) client.subscribeGuildPresence(guildId, memberIds);
+        }, i * STAGGER_MS);
+    });
+
+    if (fingerprint !== lastSubFingerprint) {
+        lastSubFingerprint = fingerprint;
+        log.info(
+            `Presence subscriptions renewed: ${all.length} guild(s), tracking ` +
+            `${rows.length} target(s) via op 14 member push` +
+            (batch.length < all.length ? ` (batch ${batch.length}/${all.length}, round-robin)` : "")
+        );
+    } else {
+        log.debug(`Presence subscriptions renewed: ${all.length} guild(s) (unchanged)`);
+    }
+}
+
+// ── Presence renewal + stale-offline reconciliation scheduler ────────────────
+
+function schedulePresenceRenewal(): void {
+    if (presenceSubscriptionInterval) clearInterval(presenceSubscriptionInterval);
+
+    // 30 s default, hard floor of 10 s (PATCH /api/config validates the same
+    // minimum). ±20% jitter softens the otherwise perfectly periodic op-14
+    // signature while keeping every cycle far below Discord's ~60 s expiry
+    // window for offline-member subscriptions.
+    const period = withJitter(Math.max(10_000, config.presenceRenewIntervalMs));
+
+    presenceSubscriptionInterval = setInterval(() => {
+        if (!gateway?.isConnected()) return;
+
+        try { subscribeGuildPresences(gateway); }
+        catch (err: any) { log.warn(`Presence renewal failed: ${err.message}`); }
+
+        // Offline reconciliation: gateway events alone cannot recover a missed
+        // offline transition (Discord pushes NOTHING for offline members on
+        // re-subscribe), so targets cached as active with no evidence for 2+
+        // poll rounds are forced offline through the normal PRESENCE_UPDATE
+        // path — sessions close, SSE fires, the dashboard stays truthful.
+        try { sweepStalePresence(); }
+        catch (err: any) { log.warn(`Presence stale sweep failed: ${err.message}`); }
+    }, period);
 }
 
 // ── Gateway: event handler ────────────────────────────────────────────────────
@@ -454,7 +525,12 @@ function setupGatewayHandlers(client: GatewayClient): void {
                     //
                     // Offline transitions are handled exclusively by PRESENCE_UPDATE events
                     // delivered via op 14 (GUILD_SUBSCRIBE) subscriptions, which are
-                    // re-sent every 4 minutes and on every reconnect/resume.
+                    // re-sent every PRESENCE_RENEW_INTERVAL_MS (default 30 s — Discord
+                    // expires offline-member subscriptions within ~60 s) and on every
+                    // reconnect/resume. As a final safety net, sweepStalePresence()
+                    // force-offlines active-cached targets that produce no presence
+                    // evidence across 2+ poll rounds, so a missed offline transition
+                    // can never lock a status until restart.
                     //
                     // Chunks are used here ONLY for:
                     //   1. Initial presence discovery (!existing) — safe because we have
@@ -506,6 +582,11 @@ function setupGatewayHandlers(client: GatewayClient): void {
                 // ── Session resume ─────────────────────────────────────────────
                 case "RESUMED": {
                     log.info("Session resumed — re-requesting presences + re-subscribing guilds in 3 s");
+                    // Re-baseline evidence clocks so the stale sweep can't fire
+                    // inside the reconnect gap (no evidence can arrive while
+                    // disconnected); the chunks re-requested below re-stamp
+                    // within seconds.
+                    touchAllPresenceEvidence();
                     setTimeout(() => {
                         requestInitialPresences(client);
                         subscribeGuildPresences(client);
@@ -729,12 +810,23 @@ async function main(): Promise<void> {
 
     startVoiceParticipantTracker(gateway);
 
-    // Re-send op 14 GUILD_SUBSCRIBE every 4 minutes.
-    // Discord can silently drop presence subscriptions; periodic renewal ensures
-    // we keep receiving PRESENCE_UPDATE (including offline) for all target guilds.
-    presenceSubscriptionInterval = setInterval(() => {
-        if (gateway?.isConnected()) subscribeGuildPresences(gateway);
-    }, 4 * 60 * 1000);
+    // Re-send op 14 GUILD_SUBSCRIBE on a fast cadence (default 30 s) + run the
+    // stale-presence sweep. Discord silently expires op-14 subscriptions —
+    // offline members stop streaming within ~60 s of subscribing, and
+    // re-subscribing delivers nothing for offline members — so the old 4-minute
+    // renewal left multi-minute unsubscribe windows that could lock a target on
+    // a stale status until restart. With 1-2 targets the new cadence costs one
+    // op-14 per mutual guild per cycle.
+    schedulePresenceRenewal();
+
+    // Hot-reload from the dashboard (PATCH /api/config): reschedule the renewal
+    // timer when the cadence changes. The stale threshold is read at sweep time,
+    // so PRESENCE_STALE_OFFLINE_MS needs no listener.
+    onConfigChange("PRESENCE_RENEW_INTERVAL_MS", () => {
+        if (!gateway) return;
+        log.info(`Presence renewal cadence changed — rescheduling to ${config.presenceRenewIntervalMs} ms`);
+        schedulePresenceRenewal();
+    });
 
     dailySummaryInterval = setInterval(() => {
         try { computeDailySummaries(); }
